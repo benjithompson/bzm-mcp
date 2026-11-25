@@ -39,6 +39,34 @@ For a locally run server, use `"url": "http://localhost:8000/mcp"` instead.
 - Allowed values: `DELETE`, `CUD`, `DISABLE`
 - If omitted, empty, or invalid, the session falls back to `DELETE`.
 
+## Self-hosted, single process (in memory)
+
+Use this to run your own HTTP endpoint without the Storage Service. Each user sends their own BlazeMeter API key as Bearer credentials, as on the hosted endpoint.
+
+Set `BZM_MCP_STORAGE_BACKEND=memory`. The server then keeps chat sessions, dataframes, tasks and the method cache in its own process. No `BZM_STORAGE_API_*`, caller token or upload URL settings are needed.
+
+```bash
+# From source
+BZM_MCP_STORAGE_BACKEND=memory FASTMCP_HOST=0.0.0.0 FASTMCP_PORT=8000 \
+  uv run python main.py --mcp http
+
+# Container image built from source (Dockerfile.http sets the four variables above)
+docker build -f Dockerfile.http -t bzm-mcp:http .
+docker run --rm -p 8000:8000 bzm-mcp:http
+```
+
+Use `Dockerfile.http`, not `Dockerfile`. The main `Dockerfile` copies prebuilt binaries from `dist/`, which only CI produces.
+
+Clients use the same configuration as the hosted endpoint, with your own URL (for example `https://bzm-mcp.example.internal/mcp`).
+
+Rules for the in-memory backend:
+
+- Run **one process**: one replica, one uvicorn worker. State is not shared between processes. A second replica behind a load balancer gives `SESSION_INVALID` errors.
+- State is lost on restart. Clients get `SESSION_INVALID` and open a new session.
+- Isolation is the same as with the Storage Service: a session belongs to the BlazeMeter user and to the credential that opened it, partitions are keyed by `{user_id}/{mcp_session_id}`, and cache entries are keyed by user.
+- `upload_assets` is not available, because there is no upload service. Use stdio or Docker stdio for uploads.
+- The server speaks plain HTTP. Put it behind a reverse proxy or ingress that terminates TLS. API keys travel in the `Authorization` header.
+
 ## Local / operator run
 
 Transport resolution precedence: **CLI `--mcp` > `BZM_MCP_TRANSPORT` > stdio**.
@@ -69,7 +97,8 @@ docker run --rm -p 8000:8000 \
 | `FASTMCP_HOST` | Bind address (HTTP only) | `127.0.0.1` |
 | `FASTMCP_PORT` | Listen port (HTTP only). Also accepts `PORT` | `8000` |
 | `FASTMCP_STREAMABLE_HTTP_PATH` | HTTP path for the MCP endpoint | `/mcp` |
-| `BZM_STORAGE_API_BASE_URL` | Storage Service base URL (required for streamable-http). Chat sessions, session partitions, upload-ticket mint and the method cache use this origin. | — |
+| `BZM_MCP_STORAGE_BACKEND` | Where streamable-http keeps sessions, partitions and the method cache: `api` (the Storage Service) or `memory` (this process only; see [Self-hosted, single process](#self-hosted-single-process-in-memory)). With `memory`, the `BZM_STORAGE_API_*`, caller token and upload settings below are not used. | `api` |
+| `BZM_STORAGE_API_BASE_URL` | Storage Service base URL (required for streamable-http with `BZM_MCP_STORAGE_BACKEND=api`). Chat sessions, session partitions, upload-ticket mint and the method cache use this origin. | — |
 | `BZM_MCP_STORAGE_CALLER_TOKEN` | Bearer token (MCP caller identity) for every storage-api call: chat sessions, partitions, upload tickets and the method cache. Must match storage-api `BZM_STORAGE_MCP_CALLER_TOKEN`. Falls back to `BZM_MCP_TICKET_STORAGE_CALLER_TOKEN`; one of the two is required for streamable-http. | — |
 | `BZM_MCP_TICKET_STORAGE_CALLER_TOKEN` | Older name of `BZM_MCP_STORAGE_CALLER_TOKEN`, read only when that one is unset. | — |
 | `BZM_MCP_SESSION_STORAGE_TIMEOUT_SECONDS` | Timeout for storage-api session and partition calls | `15` |

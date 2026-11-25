@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 from dataclasses import dataclass, field
+import logging
 import os
 from typing import Any, Literal, Optional
 
@@ -24,6 +25,7 @@ from config.auth import (
     StdioAuthProvider,
 )
 from config.cache import CachePort, build_cache_from_env
+from config.env import ENV_PREFIX, env_str
 from config.file_access import FileAccessPort, build_file_access
 from config.identity import BlazeMeterIdentityVerifier, CachedIdentityVerifier, IdentityPort
 from config.session import HttpSessionProvider, InMemorySessionProvider, SessionPort
@@ -39,7 +41,15 @@ from config.tickets import TicketPort, build_ticket_client
 from config.token import BzmToken
 from tools.utils import ConfirmMode
 
+logger = logging.getLogger(__name__)
+
 Transport = Literal["stdio", "streamable-http"]
+
+# Where streamable-http keeps chat sessions, partitions and the method cache.
+# "api": the remote Storage Service (BZM_STORAGE_API_BASE_URL). The default.
+# "memory": this process only, for a self-hosted single-process server.
+STORAGE_BACKEND_ENV = f"{ENV_PREFIX}STORAGE_BACKEND"
+STORAGE_BACKENDS = ("api", "memory")
 
 
 @dataclass(frozen=True)
@@ -115,8 +125,10 @@ def build_runtime(
     Compose auth, identity, sessions, file access, storage and cache.
 
     - stdio: process-lifetime ``startup_token`` and in-memory session storage.
-    - streamable-http: request-scoped auth and storage API-backed sessions/partitions.
-    - cache: in-memory on stdio; the storage API cache (/cache) on streamable-http.
+    - streamable-http: request-scoped auth and storage API-backed sessions/partitions,
+      or, with BZM_MCP_STORAGE_BACKEND=memory, in-process sessions/partitions/cache.
+    - cache: in-memory on stdio and on streamable-http memory; the storage API cache
+      (/cache) on streamable-http api.
     - both: every tool call verifies the token against BlazeMeter (identity); a
       successful check is reused for BZM_MCP_IDENTITY_CACHE_TTL_SECONDS (cache).
     """
@@ -142,10 +154,14 @@ def build_runtime(
         )
 
     if transport == "streamable-http":
+        if _http_storage_backend() == "memory":
+            return _build_http_memory_runtime()
         storage_base_url = os.getenv("BZM_STORAGE_API_BASE_URL", "").strip()
         if not storage_base_url:
             raise ValueError(
-                "BZM_STORAGE_API_BASE_URL is required for streamable-http transport."
+                "BZM_STORAGE_API_BASE_URL is required for streamable-http transport. "
+                f"To run one self-hosted process without the Storage Service, set "
+                f"{STORAGE_BACKEND_ENV}=memory."
             )
         caller_token = service_caller_token()
         if not caller_token:
@@ -177,3 +193,45 @@ def build_runtime(
         )
 
     raise ValueError(f"Unknown transport: {transport}")
+
+
+def _http_storage_backend() -> str:
+    backend = env_str("STORAGE_BACKEND", "api").lower()
+    if backend not in STORAGE_BACKENDS:
+        raise ValueError(
+            f"{STORAGE_BACKEND_ENV}={backend!r} is not supported. "
+            f"Use one of: {', '.join(STORAGE_BACKENDS)}."
+        )
+    return backend
+
+
+def _build_http_memory_runtime() -> AppRuntime:
+    """
+    streamable-http with Bearer auth per request, and all state in this process.
+
+    Sessions stay scoped to the verified BlazeMeter user and the credential that
+    opened them, partitions to (user, session) and cache entries to the user, as
+    with the Storage Service. State is lost on restart and is not shared between
+    processes: run one process (one uvicorn worker, one replica). Local files and
+    upload tickets are not available, so upload_assets returns an error.
+    """
+    logger.warning(
+        "%s=memory: sessions, dataframes, tasks and cache live in this process only. "
+        "Run a single process; state is lost on restart.",
+        STORAGE_BACKEND_ENV,
+    )
+    storage = InMemorySessionStorageProvider()
+    return AppRuntime(
+        transport="streamable-http",
+        auth=HttpAuthProvider(),
+        storage=storage,
+        file_access=build_file_access("streamable-http"),
+        scope_resolver=DefaultSessionScopeResolver(),
+        user_config={},
+        tickets=None,
+        identity=CachedIdentityVerifier(BlazeMeterIdentityVerifier()),
+        # A purged session releases its partition.
+        sessions=InMemorySessionProvider(on_purge=storage.discard_session),
+        # In-memory: entries stay keyed by user (CacheScope.USER) as on the storage API.
+        cache=build_cache_from_env(),
+    )
