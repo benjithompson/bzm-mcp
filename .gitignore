@@ -25,6 +25,8 @@ mend-cli
 # Local credentials (never commit)
 dist/api-key.json
 api-key.json
+# Downloaded key files get suffixes, e.g. "api-key (3).json"
+api-key*.json
 
 # Local/PyInstaller build artifacts
 bzm-mcp-linux-arm64.spec
